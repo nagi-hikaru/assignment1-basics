@@ -158,7 +158,11 @@ class BPE:
 
         for sub_text in split_text:
             for token in re.finditer(self.PAT, sub_text):
-                key = tuple(bytes([i]) for i in token.group().encode("utf-8"))
+
+                # 加速2 -> 切片避免每次重新转换
+                raw = token.group().encode("utf-8")
+                key = tuple(raw[i:i+1] for i in range(len(raw)))
+                # key = tuple(bytes([i]) for i in token.group().encode("utf-8"))
                 token_dict[key] += 1
 
                 for i in range(len(key) - 1):
@@ -199,6 +203,11 @@ class BPE:
         """把所有 token 中的 ``merge_pair`` 替换为 ``merge_bytes``，同步维护计数。"""
         updated_tokens = []
         for token, count in self.all_token_dict.items():
+
+            # 加速1 -> 快速跳过
+            if merge_pair[0] not in token or merge_pair[1] not in token:
+                continue
+
             new_token = list(token)
             updated = False
             i = 0
