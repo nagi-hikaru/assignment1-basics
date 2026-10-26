@@ -43,8 +43,8 @@ class BPE:
         self.num_processes = num_processes
 
         # 初始化词表和合并列表
-        self.vocab = [s.encode("utf-8") for s in special_tokens] + [bytes([i]) for i in range(256)]
-        self.idx2token = None
+        self.vocab_list = [s.encode("utf-8") for s in special_tokens] + [bytes([i]) for i in range(256)]
+        self.vocab_ = None
         self.merges = []
 
         # 初始化 all_token_dict 和 pair_dict
@@ -69,7 +69,7 @@ class BPE:
         流程：并行预分词 → 累计计数 → 循环合并最高频字节对 → 翻转词表。
 
         Returns:
-            ``(vocab_dict, merges)``：token 索引 → 字节串 的字典，
+            ``(vocab, merges)``：token 索引 → 字节串 的字典，
             以及按合并顺序记录的字节对列表。
         """
         res_dicts = self._pre_tokenize()
@@ -77,15 +77,15 @@ class BPE:
         self._train_merges()
 
         # 翻转词表字典
-        self.idx2token = {idx: token for idx, token in enumerate(self.vocab)}
-        return self.idx2token, self.merges
+        self.vocab_ = {idx: token for idx, token in enumerate(self.vocab_list)}
+        return self.vocab_, self.merges
 
 
     def save(self, path: Path) -> None:
         """将词表和合并列表序列化到 ``path``（pickle 格式）。"""
         with open(path, "wb") as f:
             pickle.dump(
-                {"vocab": self.idx2token, "merges": self.merges},
+                {"vocab": self.vocab_, "merges": self.merges},
                 f,
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
@@ -179,20 +179,36 @@ class BPE:
             for pair, count in pair_dict.items():
                 self.all_pair_dict[pair] += count
 
+
     def _train_merges(self) -> None:
-        """循环合并最高频字节对，直到达到 ``vocab_size`` 或无 pair 可合并。"""
+        """循环合并最高频字节对，直到达到 ``vocab_size`` 或无 pair 可合并。"""  
+
+        # 初始化桶排序参数
+        self._buckets = defaultdict(set)
+        self._max_count = 0
+
+        for pair, count in self.all_pair_dict.items():
+            self._buckets[count].add(pair)
+            if count > self._max_count:
+                self._max_count = count
+
         pbar = tqdm(
             total=self.vocab_size, 
             initial= 256 + len(self.special_tokens),
             desc="BPE training:", 
             unit=" merge"
         )
-        while len(self.all_pair_dict) > 0 and len(self.vocab) < self.vocab_size:
-            merge_pair = max(
-                self.all_pair_dict.items(), key=lambda x: (x[1], x[0])
-            )[0]
+        while len(self.vocab_list) < self.vocab_size:
+            # 加速3 -> 桶排序寻找合并字节对
+            # TS_VALID：5s -> 2s
+            while self._max_count > 0 and not self._buckets[self._max_count]:
+                self._max_count -= 1
+            if self._max_count == 0:
+                break
+            
+            merge_pair = max(self._buckets[self._max_count])
             merge_bytes = merge_pair[0] + merge_pair[1]
-            self.vocab.append(merge_bytes)
+            self.vocab_list.append(merge_bytes)
             self.merges.append(merge_pair)
             self._apply_merge(merge_pair, merge_bytes)
             pbar.update(1)
@@ -205,6 +221,7 @@ class BPE:
         for token, count in self.all_token_dict.items():
 
             # 加速1 -> 快速跳过
+            # TS_VALID：11s -> 5s
             if merge_pair[0] not in token or merge_pair[1] not in token:
                 continue
 
@@ -215,13 +232,13 @@ class BPE:
                 if (new_token[i], new_token[i + 1]) == merge_pair:
                     updated = True
 
-                    self._dec_pair(merge_pair, count)
+                    self._update_pair(merge_pair, -count)
                     if i > 0:
-                        self.all_pair_dict[(new_token[i - 1], merge_bytes)] += count
-                        self._dec_pair((new_token[i - 1], new_token[i]), count)
+                        self._update_pair((new_token[i - 1], merge_bytes), count)
+                        self._update_pair((new_token[i - 1], new_token[i]), -count)
                     if i < len(new_token) - 2:
-                        self.all_pair_dict[(merge_bytes, new_token[i + 2])] += count
-                        self._dec_pair((new_token[i + 1], new_token[i + 2]), count)
+                        self._update_pair((merge_bytes, new_token[i + 2]), count)
+                        self._update_pair((new_token[i + 1], new_token[i + 2]), -count)
 
                     new_token[i] = merge_bytes
                     new_token.pop(i + 1)
@@ -237,11 +254,18 @@ class BPE:
             )
 
 
-    def _dec_pair(self, pair: tuple[bytes, bytes], count: int) -> None:
-        """减少 pair 计数，归零则从 ``pair_dict`` 中删除。"""
-        self.all_pair_dict[pair] -= count
-        if self.all_pair_dict[pair] == 0:
+    def _update_pair(self, pair: tuple[bytes, bytes], delta: int):
+        """更新 all_pair_dict 和桶"""
+        prev_count = self.all_pair_dict[pair]
+        curr_count = prev_count + delta
+
+        self._buckets[prev_count].discard(pair)    
+        if curr_count == 0:
             del self.all_pair_dict[pair]
+        else:
+            self.all_pair_dict[pair] = curr_count
+            self._buckets[curr_count].add(pair)
+
 
 
 if __name__ == "__main__":
