@@ -162,3 +162,5 @@ cython_debug/
 .ruff_cache/
 *.zip
 /data/
+*.svg
+/cs336_assignment1_basics_zh.pdf
